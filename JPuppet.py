@@ -1,138 +1,79 @@
 
-
-
-
 import os
 import re
-import subprocess
-import tempfile
-import sqlite3
 import hashlib
+import tempfile
+import ctypes
+from ctypes import c_void_p, c_int, c_char_p, POINTER
+import subprocess
 
 class JPuppet:
-    def __init__(self):
-        self.db_path = os.path.join(tempfile.gettempdir(), "jpuppet_hotspot.db")
-        self.cache = {}   # HotSpot-like cache
-        self.hot_counts = {}  # Track how many times a class ran
-        self._init_db()
-        self._load_cache()
+    def __init__(self, jvm_path=None):
+        self.cache = {}       # hash -> output
+        self.hot_counts = {}  # hash -> run count
+        self._embed_jvm(jvm_path)
 
-    # DB Initialization
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS jit_cache (
-                hash TEXT PRIMARY KEY,
-                class_name TEXT,
-                java_code TEXT,
-                output TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-    # Load DB cache into memory
-    def _load_cache(self):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        for row in c.execute("SELECT hash, class_name, java_code, output FROM jit_cache"):
-            self.cache[row[0]] = {
-                "class_name": row[1],
-                "java_code": row[2],
-                "output": row[3]
-            }
-            self.hot_counts[row[0]] = 0
-        conn.close()
-
-    # Hash Java code
-    def _hash_code(self, java_code: str) -> str:
+    def _hash_code(self, java_code: str):
         return hashlib.sha256(java_code.encode("utf-8")).hexdigest()
 
-    # Store cache
-    def _store_cache(self, code_hash: str, class_name: str, java_code: str, output: str):
-        self.cache[code_hash] = {
-            "class_name": class_name,
-            "java_code": java_code,
-            "output": output
-        }
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO jit_cache VALUES (?, ?, ?, ?)",
-                  (code_hash, class_name, java_code, output))
-        conn.commit()
-        conn.close()
+    def _embed_jvm(self, jvm_path=None):
+        if jvm_path is None:
+            jvm_path = r"C:\Program Files\OpenLogic\jdk-21.0.4.7-hotspot\bin\server\jvm.dll"
+        self.jvm = ctypes.cdll.LoadLibrary(jvm_path)
+        # Minimal JVM init for future direct calls (JNI)
+        class JavaVMOption(ctypes.Structure):
+            _fields_ = [("optionString", c_char_p), ("extraInfo", c_void_p)]
+        class JavaVMInitArgs(ctypes.Structure):
+            _fields_ = [
+                ("version", c_int),
+                ("nOptions", c_int),
+                ("options", POINTER(JavaVMOption)),
+                ("ignoreUnrecognized", c_int)
+            ]
+        opts = (JavaVMOption * 1)()
+        opts[0].optionString = b"-Djava.class.path=."
+        args = JavaVMInitArgs()
+        args.version = 0x00010008
+        args.nOptions = 1
+        args.options = opts
+        args.ignoreUnrecognized = 1
+        self.JavaVM_p = c_void_p()
+        self.Env_p = c_void_p()
+        res = self.jvm.JNI_CreateJavaVM(ctypes.byref(self.JavaVM_p),
+                                        ctypes.byref(self.Env_p),
+                                        ctypes.byref(args))
+        if res != 0:
+            raise RuntimeError("Failed to embed JVM")
+        print("Persistent JVM embedded!")
 
-    # Run Java code (HotSpot-style)
-    def Run(self, java_code: str) -> str:
+    def Run(self, java_code: str):
         match = re.search(r'public\s+class\s+(\w+)', java_code)
         if not match:
-            return "ERROR: Could not find public class declaration"
+            return "ERROR: No public class"
         class_name = match.group(1)
         code_hash = self._hash_code(java_code)
-
-        # Increment hot count
         self.hot_counts[code_hash] = self.hot_counts.get(code_hash, 0) + 1
 
-        # First run or cache miss: compile & execute
-        if code_hash not in self.cache:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                java_file = os.path.join(temp_dir, f"{class_name}.java")
-                with open(java_file, "w", encoding="utf-8") as f:
-                    f.write(java_code)
+        # Ultra-fast: already cached
+        if code_hash in self.cache and self.hot_counts[code_hash] > 1:
+            return f"[HOTSPOT JIT - ULTRA FAST] {self.cache[code_hash]} (Run {self.hot_counts[code_hash]})"
 
-                # Compile
-                compile_proc = subprocess.run(
-                    ["javac", java_file],
-                    cwd=temp_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                if compile_proc.returncode != 0:
-                    return f"Compilation failed:\n{compile_proc.stderr}"
-
-                # Run
-                run_proc = subprocess.run(
-                    ["java", "-cp", temp_dir, class_name],
-                    cwd=temp_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                if run_proc.returncode != 0:
-                    return f"Runtime error:\n{run_proc.stderr}"
-
-                output = run_proc.stdout.strip()
-                self._store_cache(code_hash, class_name, java_code, output)
-                return f"[HOTSPOT JIT] {output} (Run {self.hot_counts[code_hash]})"
-
-        # HotSpot-style optimization: after 2+ runs, return cached instantly
-        if self.hot_counts[code_hash] > 1:
-            return f"[HOTSPOT JIT - OPTIMIZED] {self.cache[code_hash]['output']} (Run {self.hot_counts[code_hash]})"
-
-        # Otherwise, normal run (first run after compile)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            java_file = os.path.join(temp_dir, f"{class_name}.java")
-            with open(java_file, "w", encoding="utf-8") as f:
+        # First run: compile & execute
+        with tempfile.TemporaryDirectory() as tmpdir:
+            java_file = os.path.join(tmpdir, f"{class_name}.java")
+            with open(java_file, "w") as f:
                 f.write(java_code)
-            compile_proc = subprocess.run(
-                ["javac", java_file],
-                cwd=temp_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if compile_proc.returncode != 0:
-                return f"Compilation failed:\n{compile_proc.stderr}"
-            run_proc = subprocess.run(
-                ["java", "-cp", temp_dir, class_name],
-                cwd=temp_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if run_proc.returncode != 0:
-                return f"Runtime error:\n{run_proc.stderr}"
-            output = run_proc.stdout.strip()
+            # Compile
+            proc = subprocess.run(["javac", java_file], cwd=tmpdir,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                return f"Compilation failed:\n{proc.stderr}"
+            # Run
+            proc = subprocess.run(["java", "-cp", tmpdir, class_name], cwd=tmpdir,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                return f"Runtime error:\n{proc.stderr}"
+            output = proc.stdout.strip()
+            # Cache the output for ultra-fast future runs
+            self.cache[code_hash] = output
             return f"[HOTSPOT JIT] {output} (Run {self.hot_counts[code_hash]})"
